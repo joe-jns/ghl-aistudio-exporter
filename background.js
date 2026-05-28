@@ -1,0 +1,489 @@
+// background.js — MV3 service worker. The orchestrator.
+//
+// Responsibilities:
+//   • Hold current AI Studio context (bearer, projectId, locationId, tabId)
+//     received from content-script
+//   • Drive the GitHub Device Flow login
+//   • Drive the "push to GitHub" pipeline (read marker → fetch GHL files →
+//     atomic push → update mapping)
+//   • Bridge popup ↔ content-script (popup never talks to content-script
+//     directly; it always goes through here)
+
+import { GITHUB_CLIENT_ID, GITHUB_SCOPES } from "./config.js";
+import { startDeviceFlow, pollForToken } from "./lib/github-device-flow.js";
+import {
+  getAuthedUser,
+  getRepo,
+  listUserRepos,
+  createRepo,
+  readFile,
+  listRootContents,
+  pushAtomic,
+} from "./lib/github-client.js";
+import {
+  getGithubAuth,
+  setGithubAuth,
+  clearGithubAuth,
+  getProjectMapping,
+  setProjectMapping,
+  removeProjectMapping,
+} from "./lib/storage.js";
+import { MARKER_FILENAME, buildMarkerContent, parseMarker } from "./lib/marker.js";
+
+const EXTENSION_VERSION = chrome.runtime.getManifest().version;
+
+// ---------- State ----------
+
+let currentContext = {
+  bearer: null,
+  projectId: null,
+  locationId: null,
+  projectName: null,
+  capturedAt: 0,
+  tabId: null,
+  frameId: null,
+};
+
+let loginState = null; // { userCode, verificationUri, expiresIn, startedAt, abortController, result?, error? }
+const pushStateByProjectId = new Map(); // projectId → progress object
+
+// ---------- Helpers ----------
+
+function setBadge(text, color = "#4f46e5") {
+  chrome.action.setBadgeText({ text }).catch(() => {});
+  if (text) chrome.action.setBadgeBackgroundColor({ color }).catch(() => {});
+}
+
+async function sendToContentScript(type, payload) {
+  if (!currentContext.tabId) {
+    throw new Error("No active AI Studio tab — open a project first.");
+  }
+  return chrome.tabs.sendMessage(
+    currentContext.tabId,
+    { type, payload },
+    currentContext.frameId !== null ? { frameId: currentContext.frameId } : undefined,
+  );
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function commitMessageFor(projectName, fileCount) {
+  const now = new Date();
+  const yyyy = now.getUTCFullYear();
+  const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(now.getUTCDate()).padStart(2, "0");
+  const hh = String(now.getUTCHours()).padStart(2, "0");
+  const mi = String(now.getUTCMinutes()).padStart(2, "0");
+  const stamp = `${yyyy}-${mm}-${dd} ${hh}:${mi} UTC`;
+  return [
+    `Sync from AI Studio • ${stamp}`,
+    "",
+    `Project: ${projectName || "(unnamed)"}`,
+    `Files: ${fileCount}`,
+    `Pushed by: ghl-aistudio-exporter v${EXTENSION_VERSION}`,
+  ].join("\n");
+}
+
+function sanitizePath(p) {
+  if (typeof p !== "string" || p.length === 0) return null;
+  if (p.startsWith("/") || p.includes("\\")) return null;
+  const segments = p.split("/");
+  for (const s of segments) {
+    if (s === "" || s === "." || s === "..") return null;
+  }
+  return p;
+}
+
+// ---------- UI state derivation ----------
+
+async function deriveUiState() {
+  const auth = await getGithubAuth();
+  const mapping = currentContext.projectId
+    ? await getProjectMapping(currentContext.projectId)
+    : null;
+  const activePush = currentContext.projectId
+    ? pushStateByProjectId.get(currentContext.projectId)
+    : null;
+
+  return {
+    extensionVersion: EXTENSION_VERSION,
+    context: {
+      hasProject: !!currentContext.projectId,
+      projectId: currentContext.projectId,
+      locationId: currentContext.locationId,
+      projectName: currentContext.projectName,
+      hasBearer: !!currentContext.bearer,
+      bearerAgeMs: currentContext.capturedAt ? Date.now() - currentContext.capturedAt : null,
+    },
+    auth: auth ? { login: auth.user?.login, avatarUrl: auth.user?.avatarUrl } : null,
+    mapping,
+    activePush: activePush ? { ...activePush } : null,
+  };
+}
+
+// ---------- Login flow ----------
+
+async function beginLogin() {
+  if (loginState && !loginState.error && !loginState.result) {
+    // Already in progress.
+    return { ok: true, ...publicLoginState() };
+  }
+  const abort = new AbortController();
+  loginState = {
+    startedAt: Date.now(),
+    abortController: abort,
+    userCode: null,
+    verificationUri: null,
+    expiresIn: 0,
+    result: null,
+    error: null,
+  };
+
+  try {
+    const dev = await startDeviceFlow(GITHUB_CLIENT_ID, GITHUB_SCOPES);
+    loginState.userCode = dev.userCode;
+    loginState.verificationUri = dev.verificationUri;
+    loginState.expiresIn = dev.expiresIn;
+    loginState.deviceCode = dev.deviceCode;
+    loginState.interval = dev.interval;
+
+    // Don't await — poll in background. Popup reads progress separately.
+    (async () => {
+      try {
+        const tok = await pollForToken(GITHUB_CLIENT_ID, dev.deviceCode, dev.interval, abort.signal);
+        const user = await getAuthedUser(tok.accessToken);
+        await setGithubAuth(tok.accessToken, {
+          login: user.login,
+          id: user.id,
+          avatarUrl: user.avatar_url,
+        });
+        loginState.result = { login: user.login };
+        setBadge("");
+      } catch (e) {
+        loginState.error = String(e?.message || e);
+        loginState.errorCode = e?.code || null;
+      }
+    })();
+
+    return { ok: true, ...publicLoginState() };
+  } catch (e) {
+    loginState.error = String(e?.message || e);
+    return { ok: false, error: loginState.error };
+  }
+}
+
+function publicLoginState() {
+  if (!loginState) return { state: "idle" };
+  if (loginState.result) return { state: "done", login: loginState.result.login };
+  if (loginState.error) return { state: "error", message: loginState.error, code: loginState.errorCode };
+  if (loginState.userCode) {
+    return {
+      state: "pending",
+      userCode: loginState.userCode,
+      verificationUri: loginState.verificationUri,
+      expiresIn: loginState.expiresIn,
+      startedAt: loginState.startedAt,
+    };
+  }
+  return { state: "starting" };
+}
+
+function cancelLogin() {
+  if (loginState?.abortController) loginState.abortController.abort();
+  loginState = null;
+  return { ok: true };
+}
+
+// ---------- Push flow ----------
+
+async function beginPush(choice) {
+  if (!currentContext.projectId || !currentContext.locationId) {
+    return { ok: false, error: "Open an AI Studio project first." };
+  }
+  const auth = await getGithubAuth();
+  if (!auth?.accessToken) {
+    return { ok: false, error: "Not logged in to GitHub." };
+  }
+  const projectId = currentContext.projectId;
+  if (pushStateByProjectId.has(projectId) && pushStateByProjectId.get(projectId).status === "running") {
+    return { ok: false, error: "A sync is already running for this project." };
+  }
+  const state = {
+    status: "running",
+    step: "verifying",
+    detail: "",
+    progress: { done: 0, total: 0 },
+    startedAt: Date.now(),
+    result: null,
+    error: null,
+  };
+  pushStateByProjectId.set(projectId, state);
+
+  // Don't await — run in background; popup polls.
+  runPush(auth.accessToken, auth.user, projectId, choice, state).catch((e) => {
+    state.status = "error";
+    state.error = String(e?.message || e);
+  });
+
+  return { ok: true };
+}
+
+async function runPush(token, githubUser, projectId, choice, state) {
+  const ctx = { ...currentContext };
+  if (!ctx.projectId || ctx.projectId !== projectId) {
+    throw new Error("Context drifted — refresh AI Studio and retry.");
+  }
+
+  // 1. Resolve target repo (existing or new).
+  let owner, repoName, defaultBranch;
+
+  if (choice.kind === "new") {
+    state.step = "creating-repo";
+    state.detail = `Creating ${githubUser.login}/${choice.name}…`;
+    const created = await createRepo(token, {
+      name: choice.name,
+      isPrivate: !!choice.isPrivate,
+      description: `AI Studio backup • ${ctx.projectName || projectId}`,
+    });
+    owner = created.owner.login;
+    repoName = created.name;
+    defaultBranch = created.default_branch || "main";
+  } else if (choice.kind === "existing") {
+    owner = choice.owner;
+    repoName = choice.name;
+    state.step = "checking-repo";
+    state.detail = `Checking ${owner}/${repoName}…`;
+    const repo = await getRepo(token, owner, repoName);
+    if (!repo) throw new Error(`Repo ${owner}/${repoName} not found.`);
+    defaultBranch = repo.default_branch || "main";
+
+    // Marker check: read .ghl-aistudio-sync.json from the default branch.
+    const marker = await readFile(token, owner, repoName, MARKER_FILENAME, defaultBranch);
+    if (marker) {
+      const parsed = parseMarker(marker.contentText);
+      if (!parsed) {
+        throw new Error(`Marker file in ${owner}/${repoName} is corrupted. Pick a different repo.`);
+      }
+      if (parsed.projectId !== String(projectId)) {
+        throw new Error(`Repo ${owner}/${repoName} is linked to a different AI Studio project. Pick a different repo or clear the mapping.`);
+      }
+      // OK to overwrite — same project.
+    } else {
+      // No marker. Repo must be empty (or only have an auto-init README).
+      const contents = await listRootContents(token, owner, repoName, defaultBranch);
+      if (contents && contents.length > 0) {
+        const onlyReadme = contents.length === 1 && contents[0].name?.toLowerCase() === "readme.md";
+        if (!onlyReadme) {
+          throw new Error(`Repo ${owner}/${repoName} already has content not managed by this extension. Pick an empty repo or create a new one.`);
+        }
+      }
+    }
+  } else {
+    throw new Error("Unknown repo choice kind: " + choice.kind);
+  }
+
+  // 2. Fetch files from GHL via content-script proxy.
+  state.step = "fetching-files";
+  state.detail = "Fetching files from AI Studio…";
+  const filesResp = await sendToContentScript("fetch-ghl-project-files");
+  if (!filesResp?.ok) {
+    throw new Error("Failed to fetch files: " + (filesResp?.error || "unknown"));
+  }
+  const ghlFiles = filesResp.data;
+  if (!Array.isArray(ghlFiles) || ghlFiles.length === 0) {
+    throw new Error("AI Studio returned no files for this project.");
+  }
+
+  // 3. Optionally fetch updated project metadata for the commit message.
+  let projectName = ctx.projectName;
+  try {
+    const metaResp = await sendToContentScript("fetch-ghl-project-metadata");
+    if (metaResp?.ok && metaResp.data?.name) projectName = metaResp.data.name;
+  } catch {
+    // Non-fatal; commit message just falls back to projectId.
+  }
+
+  // 4. Build the file set: sanitize paths, append marker.
+  const existingMapping = await getProjectMapping(projectId);
+  const now = nowIso();
+  const files = [];
+  for (const f of ghlFiles) {
+    const safePath = sanitizePath(f.path);
+    if (!safePath) {
+      throw new Error(`AI Studio returned a suspicious file path: ${JSON.stringify(f.path)}. Push aborted.`);
+    }
+    if (safePath === MARKER_FILENAME) {
+      // AI Studio file conflicts with our marker — skip the AI Studio one; we write our own.
+      continue;
+    }
+    files.push({
+      path: safePath,
+      content: typeof f.content === "string" ? f.content : String(f.content ?? ""),
+      mode: "100644",
+      encoding: f.kind === "binary" ? "base64" : "utf-8",
+    });
+  }
+
+  files.push({
+    path: MARKER_FILENAME,
+    content: buildMarkerContent({
+      projectId,
+      locationId: ctx.locationId,
+      projectName,
+      firstSyncedAt: existingMapping?.firstSyncedAt || now,
+      lastSyncedAt: now,
+      extensionVersion: EXTENSION_VERSION,
+    }),
+    mode: "100644",
+    encoding: "utf-8",
+  });
+
+  state.progress = { done: 0, total: files.length };
+
+  // 5. Push atomically.
+  state.step = "pushing";
+  state.detail = `Pushing ${files.length} files as one commit…`;
+  const branch = defaultBranch || "main";
+
+  // For progress signaling we don't have a hook inside pushAtomic; we just
+  // show the total upfront. Future polish: instrument pushAtomic with a
+  // per-blob callback.
+  const result = await pushAtomic(token, {
+    owner,
+    repo: repoName,
+    branch,
+    files,
+    commitMessage: commitMessageFor(projectName, files.length),
+  });
+
+  // 6. Update mapping.
+  state.step = "saving-mapping";
+  state.detail = "Saving project ↔ repo link…";
+  await setProjectMapping(projectId, {
+    repoOwner: owner,
+    repoName: repoName,
+    repoFullName: `${owner}/${repoName}`,
+    repoUrl: `https://github.com/${owner}/${repoName}`,
+    defaultBranch: branch,
+    firstSyncedAt: existingMapping?.firstSyncedAt || now,
+    lastSyncedAt: now,
+    lastSyncCommitSha: result.commitSha,
+  });
+
+  // 7. Done.
+  state.status = "done";
+  state.step = "done";
+  state.detail = "";
+  state.result = {
+    commitSha: result.commitSha,
+    commitUrl: result.htmlUrl,
+    repoUrl: `https://github.com/${owner}/${repoName}`,
+    fileCount: files.length,
+  };
+  state.finishedAt = Date.now();
+  setBadge("");
+}
+
+// ---------- Message router ----------
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || typeof msg.type !== "string") return false;
+
+  // From content-script
+  if (msg.type === "context-update") {
+    currentContext = {
+      ...currentContext,
+      ...msg.payload,
+      tabId: sender.tab?.id ?? currentContext.tabId,
+      frameId: sender.frameId ?? currentContext.frameId,
+    };
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (msg.type === "button-clicked") {
+    // The in-page modal is the primary UI; this message is a heartbeat
+    // (telemetry hook, future analytics). No badge, no popup open here.
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  // From popup (native or modal-hosted)
+  if (msg.type === "get-ui-state") {
+    deriveUiState().then((s) => sendResponse({ ok: true, data: s }));
+    return true;
+  }
+
+  if (msg.type === "begin-login") {
+    beginLogin().then(sendResponse);
+    return true;
+  }
+
+  if (msg.type === "get-login-progress") {
+    sendResponse({ ok: true, data: publicLoginState() });
+    return false;
+  }
+
+  if (msg.type === "cancel-login") {
+    cancelLogin();
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (msg.type === "list-repos") {
+    (async () => {
+      const auth = await getGithubAuth();
+      if (!auth?.accessToken) return sendResponse({ ok: false, error: "Not logged in." });
+      try {
+        const repos = await listUserRepos(auth.accessToken);
+        sendResponse({ ok: true, data: repos });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e?.message || e) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === "begin-push") {
+    beginPush(msg.payload).then(sendResponse);
+    return true;
+  }
+
+  if (msg.type === "get-push-progress") {
+    const pid = msg.payload?.projectId || currentContext.projectId;
+    const s = pid ? pushStateByProjectId.get(pid) : null;
+    sendResponse({ ok: true, data: s ? { ...s } : null });
+    return false;
+  }
+
+  if (msg.type === "clear-push-state") {
+    const pid = msg.payload?.projectId || currentContext.projectId;
+    if (pid) pushStateByProjectId.delete(pid);
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (msg.type === "clear-mapping") {
+    const pid = msg.payload?.projectId || currentContext.projectId;
+    if (pid) {
+      removeProjectMapping(pid).then(() => sendResponse({ ok: true }));
+      return true;
+    }
+    sendResponse({ ok: false, error: "No project context." });
+    return false;
+  }
+
+  if (msg.type === "logout") {
+    clearGithubAuth().then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
+  return false;
+});
+
+chrome.action.onClicked.addListener(() => {
+  // Popup is opened automatically; this fires only if no popup is set,
+  // which shouldn't happen given our manifest. Kept for safety.
+});
