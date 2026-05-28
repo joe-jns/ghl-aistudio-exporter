@@ -2,7 +2,7 @@
 // the service worker.
 
 const $view = document.getElementById("view");
-const $headerRight = document.getElementById("header-right");
+const $footer = document.getElementById("account-footer");
 
 let pollTimer = null;
 function stopPolling() {
@@ -44,29 +44,31 @@ function escapeHtml(s) {
     .replace(/'/g, "&#39;");
 }
 
-// ---------- Header ----------
+// ---------- Account footer ----------
 
-function renderHeader(state) {
-  $headerRight.replaceChildren();
-  if (state.auth?.login) {
-    $headerRight.appendChild(
-      el("span", { class: "login-badge" }, `@${state.auth.login}`),
-    );
-    $headerRight.appendChild(
-      el(
-        "span",
-        {
-          class: "logout-link",
-          title: "Sign out",
-          onclick: async () => {
-            await send("logout");
-            await refresh();
-          },
-        },
-        "logout",
-      ),
-    );
+function renderFooter(state) {
+  if (!state.auth?.login) {
+    $footer.hidden = true;
+    $footer.replaceChildren();
+    return;
   }
+  $footer.hidden = false;
+  $footer.replaceChildren(
+    el("span", { class: "dot", "aria-label": "connected" }),
+    el("span", { class: "who" }, `@${state.auth.login}`),
+    el(
+      "button",
+      {
+        class: "logout-btn",
+        title: "Sign out of GitHub",
+        onclick: async () => {
+          await send("logout");
+          await refresh();
+        },
+      },
+      "Logout",
+    ),
+  );
 }
 
 // ---------- Views ----------
@@ -79,7 +81,7 @@ async function refresh() {
     return;
   }
   const state = r.data;
-  renderHeader(state);
+  renderFooter(state);
   route(state);
 }
 

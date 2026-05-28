@@ -180,25 +180,43 @@
 
   function ensureButton() {
     if (!latestProjectId) return;
-    if (document.getElementById(BUTTON_ID)) return;
 
     const publishBtn = findPublishButton();
+    const existing = document.getElementById(BUTTON_ID);
+
+    if (existing) {
+      const mode = existing.dataset.ghlExpMode;
+      // If we're currently floating but Publish just appeared, upgrade
+      // to anchored so the button lives in the toolbar instead of floating.
+      if (mode === "floating" && publishBtn) {
+        existing.remove();
+        // fall through to inject anchored
+      } else {
+        // Already anchored, or no Publish yet — leave the current button alone.
+        return;
+      }
+    }
+
     if (publishBtn) {
-      // Insert as sibling left of Publish (or its wrapper).
-      // The toolbar uses flexbox with gap-2, so we get spacing for free.
+      // Insert as a sibling left of Publish (or its wrapper).
+      // The toolbar uses flexbox with gap-2, so spacing is automatic.
       let anchor = publishBtn;
       // If Publish is wrapped (e.g. <div class="relative">), insert before
       // the wrapper to stay on the flex level.
       if (anchor.parentElement && anchor.parentElement.children.length === 1) {
         anchor = anchor.parentElement;
       }
-      anchor.parentNode.insertBefore(buildButton({ floating: false }), anchor);
+      const btn = buildButton({ floating: false });
+      btn.dataset.ghlExpMode = "anchored";
+      anchor.parentNode.insertBefore(btn, anchor);
       return;
     }
 
-    // Fallback: floating button if Publish isn't found.
+    // Fallback: floating button until Publish loads.
     if (!document.body) return;
-    document.body.appendChild(buildButton({ floating: true }));
+    const btn = buildButton({ floating: true });
+    btn.dataset.ghlExpMode = "floating";
+    document.body.appendChild(btn);
   }
 
   // Re-attach if the SPA strips the button.

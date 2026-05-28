@@ -33,6 +33,11 @@ import { MARKER_FILENAME, buildMarkerContent, parseMarker } from "./lib/marker.j
 const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 
 // ---------- State ----------
+//
+// `currentContext` lives in module memory AND in chrome.storage.session so
+// it survives the service worker being suspended/killed between user
+// interactions. The promise `contextReady` resolves once the in-memory
+// copy has been hydrated from storage on every SW boot.
 
 let currentContext = {
   bearer: null,
@@ -43,6 +48,19 @@ let currentContext = {
   tabId: null,
   frameId: null,
 };
+
+const contextReady = chrome.storage.session
+  .get("currentContext")
+  .then((r) => {
+    if (r.currentContext) {
+      currentContext = { ...currentContext, ...r.currentContext };
+    }
+  })
+  .catch(() => {});
+
+function persistContext() {
+  chrome.storage.session.set({ currentContext }).catch(() => {});
+}
 
 let loginState = null; // { userCode, verificationUri, expiresIn, startedAt, abortController, result?, error? }
 const pushStateByProjectId = new Map(); // projectId → progress object
@@ -199,6 +217,7 @@ function cancelLogin() {
 // ---------- Push flow ----------
 
 async function beginPush(choice) {
+  await contextReady;
   if (!currentContext.projectId || !currentContext.locationId) {
     return { ok: false, error: "Open an AI Studio project first." };
   }
@@ -399,6 +418,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       tabId: sender.tab?.id ?? currentContext.tabId,
       frameId: sender.frameId ?? currentContext.frameId,
     };
+    persistContext();
     sendResponse({ ok: true });
     return false;
   }
@@ -412,7 +432,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // From popup (native or modal-hosted)
   if (msg.type === "get-ui-state") {
-    deriveUiState().then((s) => sendResponse({ ok: true, data: s }));
+    contextReady.then(() => deriveUiState()).then((s) => sendResponse({ ok: true, data: s }));
     return true;
   }
 
