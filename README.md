@@ -10,31 +10,20 @@ A Chrome extension (MV3) that adds an **"Export to GitHub"** button to GoHighLev
 
 ## Install
 
-This is an unpacked extension (not on the Chrome Web Store).
+This is an unpacked extension (not on the Chrome Web Store yet).
 
-### 1. Register a GitHub OAuth App (one time)
+1. Download or clone this repo:
+   ```bash
+   git clone https://github.com/joe-jns/ghl-aistudio-exporter.git
+   ```
+2. Open `chrome://extensions` in Chrome (or any Chromium-based browser).
+3. Toggle **Developer mode** on (top right).
+4. Click **Load unpacked** and select the folder you just cloned.
+5. Pin the extension icon to your toolbar.
 
-1. Go to https://github.com/settings/developers → **New OAuth App**.
-2. Application name: anything (e.g. `AI Studio Exporter`).
-3. Homepage URL: anything.
-4. Authorization callback URL: anything non-empty (Device Flow ignores it — `http://localhost` is fine).
-5. Create the app, then on its settings page **tick "Enable Device Flow"** at the bottom and save.
-6. Copy the **Client ID** (not the secret — you won't need one).
+That's it — no GitHub OAuth App registration needed. The extension ships with a pre-configured Client ID; on first use it asks GitHub to authorize **your** account against the extension's app, and the resulting access token lives only in your browser's local storage.
 
-### 2. Configure the extension
-
-```bash
-cp config.example.js config.js
-```
-
-Open `config.js` and paste your Client ID in place of the placeholder.
-
-### 3. Load the extension
-
-1. Open `chrome://extensions` in Chrome (or any Chromium-based browser).
-2. Toggle **Developer mode** on (top right).
-3. Click **Load unpacked** and select this folder.
-4. Pin the extension icon to your toolbar.
+> Forking the extension and want your own OAuth App identity instead? See `config.example.js`.
 
 ## Use
 

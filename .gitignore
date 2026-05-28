@@ -1,7 +1,3 @@
-# Personal config (your GitHub OAuth App Client ID). Copy config.example.js
-# to config.js locally — never commit your client_id.
-config.js
-
 # Local-only docs: recon notes and design spec contain real project /
 # location / user IDs from the captured session. Kept locally for reference
 # but not for the public repo.
