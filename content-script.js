@@ -24,7 +24,30 @@
   }
 
   // --- Receive messages from MAIN world ---
-  let context = { bearer: null, projectId: null, locationId: null, capturedAt: 0 };
+  let context = { bearer: null, projectId: null, locationId: null, projectName: null, capturedAt: 0 };
+  let metadataFetchedFor = null; // projectId for which we already pre-fetched metadata
+
+  async function maybePrefetchProjectName() {
+    // Lazy-fetch project metadata when we have everything needed but no name yet.
+    // This makes the popup's default repo name a slugified project name instead
+    // of the raw numeric project ID.
+    if (!context.bearer || !context.projectId || !context.locationId) return;
+    if (context.projectName) return;
+    if (metadataFetchedFor === context.projectId) return;
+    metadataFetchedFor = context.projectId;
+    try {
+      const data = await ghlGet(
+        `/vibe-ai/projects/${encodeURIComponent(context.projectId)}?alt_id=${encodeURIComponent(context.locationId)}&alt_type=location`,
+      );
+      if (data && data.name) {
+        context = { ...context, projectName: data.name };
+        chrome.runtime.sendMessage({ type: "context-update", payload: context }).catch(() => {});
+      }
+    } catch {
+      // Best-effort only — popup will fall back to the project ID.
+      metadataFetchedFor = null; // allow a retry on next context update
+    }
+  }
 
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
@@ -34,6 +57,7 @@
     if (data.type === "window:context") {
       context = { ...context, ...data.payload };
       chrome.runtime.sendMessage({ type: "context-update", payload: context }).catch(() => {});
+      maybePrefetchProjectName();
     } else if (data.type === "window:button-clicked") {
       // Show the in-page modal. The whole flow (login → choose repo → push)
       // happens inside it; the user never needs to click the extension icon.

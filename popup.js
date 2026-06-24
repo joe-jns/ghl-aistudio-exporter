@@ -447,16 +447,44 @@ function viewPushDone(state) {
 }
 
 function viewPushError(state) {
-  $view.replaceChildren(
-    el("div", { class: "error" }, state.activePush.error || "Push failed."),
+  const friendly = state.activePush.error || "Push failed.";
+  const raw = state.activePush.errorRaw;
+  const mentionsReload = /reload the extension/i.test(friendly);
+
+  const children = [
+    el("div", { class: "error" }, friendly),
+  ];
+
+  if (mentionsReload) {
+    children.push(
+      el("button", {
+        class: "btn btn-secondary",
+        onclick: () => chrome.tabs.create({ url: "chrome://extensions" }),
+      }, "Open chrome://extensions"),
+    );
+  }
+
+  if (raw && raw !== friendly) {
+    const details = el("details", { style: "margin: 6px 0 12px; font-size: 11px; color: #6b7280;" },
+      el("summary", { style: "cursor: pointer;" }, "Show technical details"),
+      el("pre", {
+        style: "white-space: pre-wrap; word-break: break-word; margin: 6px 0; padding: 8px; background: #f3f4f6; border-radius: 6px; font-family: ui-monospace, monospace; font-size: 11px;",
+      }, raw),
+    );
+    children.push(details);
+  }
+
+  children.push(
     el("button", {
-      class: "btn btn-secondary",
+      class: "btn btn-primary",
       onclick: async () => {
         await send("clear-push-state");
         await refresh();
       },
-    }, "OK"),
+    }, "Retry"),
   );
+
+  $view.replaceChildren(...children);
 }
 
 // ---------- Boot ----------

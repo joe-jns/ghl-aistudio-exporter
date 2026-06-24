@@ -243,10 +243,46 @@ async function beginPush(choice) {
   // Don't await — run in background; popup polls.
   runPush(auth.accessToken, auth.user, projectId, choice, state).catch((e) => {
     state.status = "error";
-    state.error = String(e?.message || e);
+    state.error = friendlyError(e);
+    state.errorRaw = String(e?.message || e);
   });
 
   return { ok: true };
+}
+
+// friendlyError — translates the most common technical failures into
+// a sentence the user can act on. Falls back to the raw message so
+// power users still see what actually went wrong.
+function friendlyError(e) {
+  const msg = String(e?.message || e || "");
+  const status = e?.status;
+
+  if (status === 401) {
+    return "GitHub rejected the token. Sign out and back in, then retry.";
+  }
+  if (status === 403 && /rate limit/i.test(msg)) {
+    return "GitHub rate limit reached. Wait a few minutes and try again.";
+  }
+  if (status === 404 && /repos\/.+\/contents/i.test(msg)) {
+    return "Couldn't find the file on GitHub. Try reloading the extension (chrome://extensions → reload) and retry.";
+  }
+  if (status === 422 && /name already exists/i.test(msg)) {
+    return "A repo with this name already exists on your GitHub. Pick a different name.";
+  }
+  if (status === 409 && /repository is empty/i.test(msg)) {
+    return "Couldn't initialize the empty repo. Reload the extension (chrome://extensions → reload) and retry. If it still fails, delete the empty repo on GitHub and create a new one.";
+  }
+  if (/no bearer captured|interact with AI Studio/i.test(msg)) {
+    return "Lost connection to AI Studio. Click anywhere in the AI Studio editor (e.g. the chat input) and retry.";
+  }
+  if (/context drifted/i.test(msg)) {
+    return "Project context changed mid-push. Refresh the AI Studio page and retry.";
+  }
+  if (/no files for this project/i.test(msg)) {
+    return "This AI Studio project has no files yet. Add something via the chat, then retry.";
+  }
+  // Default: keep the raw message but trim it to something readable.
+  return msg.length > 200 ? msg.slice(0, 200) + "…" : msg;
 }
 
 async function runPush(token, githubUser, projectId, choice, state) {
