@@ -8,6 +8,12 @@ A Chrome extension (MV3) that adds an **"Export to GitHub"** button to GoHighLev
 - Tracks the GHL-project ↔ GitHub-repo link locally so subsequent clicks re-sync to the same repo without re-prompting.
 - Refuses to overwrite repos that already have unrelated content (uses a marker file at the repo root for safety).
 
+## Watch the install tutorial (45s)
+
+[![Install tutorial — click to watch](assets/tutorial-poster.jpg)](assets/tutorial.mp4)
+
+> Click the image to open the video. Or [download the MP4 directly](assets/tutorial.mp4).
+
 ## Install
 
 This is an unpacked extension (not on the Chrome Web Store yet).
