@@ -10,9 +10,11 @@ A Chrome extension (MV3) that adds an **"Export to GitHub"** button to GoHighLev
 
 ## Watch the install tutorial (45s)
 
-[![Install tutorial — click to watch](assets/tutorial-poster.jpg)](assets/tutorial.mp4)
+https://assets.cdn.filesafe.space/mQFJ3gCpL6NWwmyisGFR/media/6a3b466e659bec99fcc8ce5d.mp4
 
-> Click the image to open the video. Or [download the MP4 directly](assets/tutorial.mp4).
+[![Install tutorial — click to watch](assets/tutorial-poster.jpg)](https://assets.cdn.filesafe.space/mQFJ3gCpL6NWwmyisGFR/media/6a3b466e659bec99fcc8ce5d.mp4)
+
+> If the embed doesn't render, click the thumbnail above to open the video in a new tab.
 
 ## Install
 
