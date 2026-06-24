@@ -250,6 +250,38 @@ async function beginPush(choice) {
   return { ok: true };
 }
 
+// validateRepoForProject — shared logic for both the "use existing repo"
+// path and the "create new repo but it already exists" fallback. Confirms
+// that the repo is either empty (or near-empty) or already linked to the
+// CURRENT AI Studio project via a matching marker file. Throws a clear
+// message if the repo belongs to a different project or has unrelated
+// content.
+async function validateRepoForProject(token, owner, repoName, branch, projectId) {
+  const marker = await readFile(token, owner, repoName, MARKER_FILENAME, branch);
+  if (marker) {
+    const parsed = parseMarker(marker.contentText);
+    if (!parsed) {
+      throw new Error(`Marker file in ${owner}/${repoName} is corrupted. Pick a different repo.`);
+    }
+    if (parsed.projectId !== String(projectId)) {
+      throw new Error(`Repo ${owner}/${repoName} is linked to a different AI Studio project. Pick a different repo or clear the mapping.`);
+    }
+    return; // marker matches — OK to overwrite
+  }
+  // No marker. Acceptable if the repo is empty (or only has an auto-init
+  // README, or only has the marker placeholder from a half-failed previous
+  // bootstrap that didn't get to write any source files yet).
+  const contents = await listRootContents(token, owner, repoName, branch);
+  if (!contents || contents.length === 0) return;
+  const onlyHarmless = contents.every((c) => {
+    const n = (c.name || "").toLowerCase();
+    return n === "readme.md" || n === ".ghl-aistudio-sync.json";
+  });
+  if (!onlyHarmless) {
+    throw new Error(`Repo ${owner}/${repoName} already has content not managed by this extension. Pick an empty repo or create a new one.`);
+  }
+}
+
 // friendlyError — translates the most common technical failures into
 // a sentence the user can act on. Falls back to the raw message so
 // power users still see what actually went wrong.
@@ -267,7 +299,10 @@ function friendlyError(e) {
     return "Couldn't find the file on GitHub. Try reloading the extension (chrome://extensions → reload) and retry.";
   }
   if (status === 422 && /name already exists/i.test(msg)) {
-    return "A repo with this name already exists on your GitHub. Pick a different name.";
+    return "A repo with this name already exists on your GitHub. Pick a different name, or pick 'Use existing repo' to push into it.";
+  }
+  if (status === 422 && /sha.*supplied/i.test(msg)) {
+    return "GitHub rejected the bootstrap because a marker file is already there. Reload the extension (chrome://extensions → reload) and retry — the self-heal should pick it up.";
   }
   if (status === 409 && /repository is empty/i.test(msg)) {
     return "Couldn't initialize the empty repo. Reload the extension (chrome://extensions → reload) and retry. If it still fails, delete the empty repo on GitHub and create a new one.";
@@ -297,14 +332,34 @@ async function runPush(token, githubUser, projectId, choice, state) {
   if (choice.kind === "new") {
     state.step = "creating-repo";
     state.detail = `Creating ${githubUser.login}/${choice.name}…`;
-    const created = await createRepo(token, {
-      name: choice.name,
-      isPrivate: !!choice.isPrivate,
-      description: `AI Studio backup • ${ctx.projectName || projectId}`,
-    });
-    owner = created.owner.login;
-    repoName = created.name;
-    defaultBranch = created.default_branch || "main";
+    let created = null;
+    try {
+      created = await createRepo(token, {
+        name: choice.name,
+        isPrivate: !!choice.isPrivate,
+        description: `AI Studio backup • ${ctx.projectName || projectId}`,
+      });
+    } catch (e) {
+      // 422 "name already exists" — a previous failed attempt likely created
+      // the repo. Validate it for reuse instead of blocking the user.
+      if (e.status === 422 && /name already exists/i.test(e.message || "")) {
+        state.detail = `Repo already exists, validating for reuse…`;
+        const existing = await getRepo(token, githubUser.login, choice.name);
+        if (!existing) throw e;
+        const existingDefault = existing.default_branch || "main";
+        await validateRepoForProject(token, githubUser.login, choice.name, existingDefault, projectId);
+        owner = existing.owner.login;
+        repoName = existing.name;
+        defaultBranch = existingDefault;
+      } else {
+        throw e;
+      }
+    }
+    if (created) {
+      owner = created.owner.login;
+      repoName = created.name;
+      defaultBranch = created.default_branch || "main";
+    }
   } else if (choice.kind === "existing") {
     owner = choice.owner;
     repoName = choice.name;
@@ -313,28 +368,7 @@ async function runPush(token, githubUser, projectId, choice, state) {
     const repo = await getRepo(token, owner, repoName);
     if (!repo) throw new Error(`Repo ${owner}/${repoName} not found.`);
     defaultBranch = repo.default_branch || "main";
-
-    // Marker check: read .ghl-aistudio-sync.json from the default branch.
-    const marker = await readFile(token, owner, repoName, MARKER_FILENAME, defaultBranch);
-    if (marker) {
-      const parsed = parseMarker(marker.contentText);
-      if (!parsed) {
-        throw new Error(`Marker file in ${owner}/${repoName} is corrupted. Pick a different repo.`);
-      }
-      if (parsed.projectId !== String(projectId)) {
-        throw new Error(`Repo ${owner}/${repoName} is linked to a different AI Studio project. Pick a different repo or clear the mapping.`);
-      }
-      // OK to overwrite — same project.
-    } else {
-      // No marker. Repo must be empty (or only have an auto-init README).
-      const contents = await listRootContents(token, owner, repoName, defaultBranch);
-      if (contents && contents.length > 0) {
-        const onlyReadme = contents.length === 1 && contents[0].name?.toLowerCase() === "readme.md";
-        if (!onlyReadme) {
-          throw new Error(`Repo ${owner}/${repoName} already has content not managed by this extension. Pick an empty repo or create a new one.`);
-        }
-      }
-    }
+    await validateRepoForProject(token, owner, repoName, defaultBranch, projectId);
   } else {
     throw new Error("Unknown repo choice kind: " + choice.kind);
   }

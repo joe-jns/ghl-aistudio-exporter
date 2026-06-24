@@ -55,7 +55,17 @@
     if (!data || data.source !== POSTMESSAGE_SOURCE) return;
 
     if (data.type === "window:context") {
-      context = { ...context, ...data.payload };
+      const incoming = data.payload;
+      // When the projectId actually changes (user switched to another AI
+      // Studio project without reloading), drop any cached projectName so
+      // the prefetch re-runs for the new project. Without this reset the
+      // truthy-projectName guard in maybePrefetchProjectName would short-
+      // circuit and we'd keep showing the previous project's name.
+      if (incoming.projectId && incoming.projectId !== context.projectId) {
+        context.projectName = null;
+        metadataFetchedFor = null;
+      }
+      context = { ...context, ...incoming };
       chrome.runtime.sendMessage({ type: "context-update", payload: context }).catch(() => {});
       maybePrefetchProjectName();
     } else if (data.type === "window:button-clicked") {
